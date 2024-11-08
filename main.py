@@ -1,154 +1,118 @@
 import operator
-import os
 from pprint import pprint
-from pyexpat.errors import messages
-from typing import TypedDict, Any, Dict
-from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from pydantic import BaseModel, Field
+from typing import TypedDict
+
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.constants import END
+from langgraph.graph import StateGraph
 
-from firecrawl import FirecrawlApp
-
-from langchain_aws import ChatBedrock
-
-from langgraph.graph import StateGraph, END
-
-from utils import llm
+from schemas import Question, Answer
+from utils import llm, extract_protocol_and_domain, get_web_content
 
 load_dotenv()
 
 class AgentState(TypedDict):
-    messages: Sequence[BaseMessage]
-    question: str
-    # current_url: str
-    # current_content: str
-    # explored_urls: Dict[str, Dict[str: Any] # {"url": {"score": 0-10, "partial_answer": ""}}
-    url_queue: Dict[str, int] # {"url": 0-10} probability score use -1 to mark as done
-    answer : str
-    content_last_checked_for_answer: str
-    # max_url_loads: int
-
-class WebQuestion(BaseModel):
-  question: str = Field(description="The unanswered question the user has")
-  url: str = Field(description="The url for the website where the answer is expected, do not include the path, "
-                               "only protocol and domain. Example: https://sub.tweakers.net")
-
-class WebAnswer(BaseModel):
-    answer: str = Field(description="The answer to the question")
-    continue_searching: bool = Field(description="If the answer is vague or not exactly what the user is looking for, set this to True")
-
-class Lead(BaseModel):
-    url: str = Field(description="The url of where information may be found, or to an url that might contain an url to the answer")
-    score: int = Field(description="The score of the url, 0-10: Where 10 is the highest probability of this url containing the answer")
-
-class Leads(BaseModel):
-    leads: Sequence[Lead] = Field(description="The leads to urls that might contain the answer")
-
-def print_state(state: AgentState):
-    state_copy = state.copy()
-    state_copy.pop('messages') if 'messages' in state_copy else None
-    state_copy.pop('content_last_checked_for_answer') if 'content_last_checked_for_answer' in state_copy else None
-    # pprint(state_copy)
+    domain: str  # contains the base url of the website
+    messages: list  # contains initial messages from the user
+    question: str  # the question the user has
+    urls_done: dict  # {"url": {"continue_searching_score": 0-100, "partial_answer": "a partial answer if there is one"}}
+    urls_queue: dict  # {"url": 0-10} probability score of url containing the answer
+    final_answer : str  # the answer found
+    continue_searching_threshold : int
+    continue_searching_increment : int
 
 def start_node(state: AgentState):
-    """
-    should extract the url and question from the chat history
-    """
-    result = llm.with_structured_output(WebQuestion).invoke(input=state["messages"])
-    state["question"] = result.question
-    state["url_queue"] = {result.url: 10}
-    print_state(state)
+    # preparing agent state so the rest of the code can be generic
+    question = llm.with_structured_output(Question).invoke(state['messages'])
+    state['question'] = question.question
+    state['domain'] = extract_protocol_and_domain(question.url)
+    state['urls_queue'] = {state['domain']: 101} # add domain as priority
+    state['urls_queue'].update({question.url: 102}) # add question url as top priority (can override the domain url)
+    state['urls_done'] = {}
+    state['continue_searching_threshold'] = 10  # if the score is above this threshold, continue searching
+    state['continue_searching_increment'] = 5  # each page that is visited, the threshold is increased by this amount
     return state
 
-def check_url_for_answer(state: AgentState):
-    """
-    should check highest scored url for the answer to the question
-    """
-    print('check_url_for_answer')
-    unexplored_urls = {k: v for k, v in state["url_queue"].items() if v > 0}
-    most_promising_url = max(unexplored_urls, key=unexplored_urls.get)
-    app = FirecrawlApp(api_key=os.environ.get('FIRECRAWL_API_KEY'))
-    response = app.scrape_url(url=most_promising_url, params={
-        'formats': ['markdown'],
-        'onlyMainContent': False
-    })
-    state["content_last_checked_for_answer"] = response['markdown']
-    messages = [
-        HumanMessage(content="{c}\n\n---\n\n{q}".format(c=response['markdown'], q=state["question"]))
-    ]
-    web_answer = llm.with_structured_output(WebAnswer).invoke(input=messages)
-    state['url_queue'][most_promising_url] = -1
-    if web_answer.continue_searching:
-        print_state(state)
+def extract_data(state: AgentState):
+    url, score = state["urls_queue"].popitem()
+    content = get_web_content(url)
+    augment_web_content = (f'current url:{url}\n\n---\n'
+                           f'current content:\n{content}\n\n---\n'
+                           f'context_of_website:\n{state.get("context_website", "no context provided yet")}\n\n---\n '
+                           f'previous_urls:\n{state.get("urls_done", "no previous steps")}\n\n---\n'
+                           f'question:\n{state["question"]}\n\n---\n'
+                           f'if you want to extracting final_answer you need at least a continue_searching_threshold '
+                           f'of {state["continue_searching_threshold"]}. Also take into account previous answer '
+                           f'candidates.')
+
+    answer :Answer = llm.with_structured_output(Answer).invoke(augment_web_content)
+
+    # Add answer as partial answer to urls_done
+    state['urls_done'][url] = {
+        "partial_answer": answer.answer_candidate,
+        "continue_searching_score": answer.continue_searching_score
+    }
+
+    # check if we can stop searching
+    if any(sub_dict['continue_searching_score'] < state['continue_searching_threshold'] for sub_dict in state['urls_done'].values()):
+        if not answer.final_answer:
+            raise ValueError("No final answer found, but continue_searching_threshold is reached")
+        urls_visited = ', '.join(list(state['urls_done'].keys())[:-1])
+        concluded_url = list(state['urls_done'].keys())[-1]
+        state['final_answer'] = (f"Looking at {urls_visited} i concluded my answer on {concluded_url}\n"
+                                 f"{answer.final_answer}")
+        state['messages'].append(AIMessage(content=state['final_answer']))
         return state
-    state["answer"] = web_answer.answer
-    print_state(state)
+
+    # update new leads, do not add leads that are already in urls_done (including the current url)
+    urls_done = state.get('urls_done', {}).keys()
+    state['urls_queue'].update({lead.url: lead.score for lead in answer.leads if lead.url not in urls_done})
+
+    # sort urls_queue so the most likely urls are last in the dict
+    state["urls_queue"] = dict(sorted(state["urls_queue"].items(), key=lambda item: item[1]))
+
+    # The longer we search the more likely we already have the answer
+    state['continue_searching_threshold'] += state['continue_searching_increment']
     return state
 
-def check_url_for_leads(state: AgentState):
-    """
-    should check last_url_checked_for_answer for url that could lead to the answer and grade them and them to
-    the url_queue also reset the last_url_checked_for_answer and move back to check_url_for_answer
-    """
-    print("check_url_for_leads")
-    content_last_checked_for_answer = state["content_last_checked_for_answer"]
-    messages = [
-        HumanMessage(content="{c}\n\n---\n\nGive me the top 3 urls that could lead to the answer for the question: {q}".format(c=content_last_checked_for_answer, q=state["question"]))
-    ]
-    leads = llm.with_structured_output(Leads).invoke(input=messages)
-    for lead in leads.leads:
-        if lead.url in state["url_queue"]:
-            continue
-        state["url_queue"][lead.url] = lead.score
-    print_state(state)
-    return state
-
-def answer_found_or_search_leads(state: AgentState):
-    if state.get("answer"):
+def continue_to_extract_data(state: AgentState):
+    # check if we can stop searching
+    if state.get('final_answer'):
         return END
-    return "check_url_for_leads"
+    return "extract_data"
 
-def unexplored_leads(state: AgentState):
-    """
-    If there are urls in the queue that have a score > 0 than return "check_url_for_answer" else END
-    """
-    if any(state["url_queue"].values()):
-        return "check_url_for_answer"
-    return END
+def get_step_message(node: str, state: AgentState):
+    if node == 'extract_data':
+        last_url = list(state['urls_done'].keys())[-1]
+        return (f"Searched {last_url}, "
+                f"continue searching score: {state['urls_done'][last_url]['continue_searching_score']}")
+    return node
+    # return f"Final answer found: {state['final_answer']}"
 
 builder = StateGraph(AgentState)
 builder.add_node("start_node", start_node)
-builder.add_node("check_url_for_answer", check_url_for_answer)
-builder.add_node("check_url_for_leads", check_url_for_leads)
-
+builder.add_node("extract_data", extract_data)
 
 builder.set_entry_point("start_node")
-builder.add_edge("start_node", "check_url_for_answer")
+builder.add_edge("start_node", "extract_data")
 builder.add_conditional_edges( # if answer is found go to END else go to check_url_for_leads
-    "check_url_for_answer",
-    answer_found_or_search_leads,
-    {END: END, "check_url_for_leads": "check_url_for_leads"}
-)
-builder.add_conditional_edges( # if there are unexplored leads go to check_url_for_answer else END
-    "check_url_for_leads",
-    unexplored_leads,
-    {END: END, "check_url_for_answer": "check_url_for_answer"}
+    "extract_data",
+    continue_to_extract_data,
+    {END: END, "extract_data": "extract_data"}
 )
 
 graph = builder.compile()
 
 for s in graph.stream(
         {"messages": [
-            HumanMessage(content="What llm models offered by Groq have a context window larger then 100k tokens on https://groq.com/ ?"),
+            # HumanMessage(content="What llm models offered by Groq have a context window larger then 100k tokens on https://groq.com ?"),
+            # HumanMessage(content="Does https://www.skybad.de sell Pipe Insulation ?"),
+            HumanMessage(content="Does https://www.skybad.de sell Wilo Varios 15/1-8 pump if yes what is the price?"),
+            # HumanMessage(content="Can u find the best price for 'Samsung Galaxy S24, 256GB' on https://tweakers.net/pricewatch/ ?"),
         ]}
     ):
-    for node, node_message in s.items():
-        print(node)
-
-
-# result = graph.invoke(
-#     {"messages": [
-#         HumanMessage(content="What llm models offered by Groq have a context window larger then 100k tokens on https://groq.com/ ?"),
-#     ]}
-# )
+    for node, state in s.items():
+        print(get_step_message(node, state))
+        if state.get('final_answer'):
+            pprint(state['messages'])
