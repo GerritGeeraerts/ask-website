@@ -1,0 +1,17 @@
+# Core dependencies
+python-dotenv
+pydantic
+
+# LangChain ecosystem
+langchain
+langchain-core
+langchain-aws
+langchain-groq
+langchain-openai
+langchain-community
+
+# LangGraph for state management
+langgraph
+
+# Web scraping
+firecrawl-py

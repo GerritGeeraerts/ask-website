@@ -109,7 +109,7 @@ if __name__ == "__main__":
             {"messages": [
                 # HumanMessage(content="What llm models offered by Groq have a context window larger then 100k tokens on https://groq.com ?"),
                 # HumanMessage(content="Does https://www.skybad.de sell Pipe Insulation ?"),
-                HumanMessage(content="Does https://www.skybad.de sell Wilo Varios 15/1-8 pump if yes what is the price?"),
+                HumanMessage(content="Can you search me a phonenumber to contact someone at: https://www.easykit.be/"),
                 # HumanMessage(content="Can u find the best price for 'Samsung Galaxy S24, 256GB' on https://tweakers.net/pricewatch/ ?"),
             ]}
         ):
